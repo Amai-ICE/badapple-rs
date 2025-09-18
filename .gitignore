@@ -1,2 +1,5 @@
 /target
 /output
+*.zst
+*.zstd
+*.mp4
