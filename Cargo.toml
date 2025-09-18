@@ -1,0 +1,20 @@
+[package]
+name = "badapple"
+version = "0.1.0"
+edition = "2024"
+
+[target.x86_64-pc-windows-gnu]
+linker="mingw64"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=wild"]
+
+[dependencies]
+rayon = "1.11"
+image = "*"
+symphonia = {version = "0.5.4", features = ["mp3"]}
+libpulse-binding = "2.5.0"
+libpulse-simple-binding = "2.5.0"
+terminal_size = "0.4.3"
+zstd = "0.13.3"
