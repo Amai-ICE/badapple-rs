@@ -15,7 +15,7 @@ use std::{
     thread,
     time::{self, Duration},
 };
-
+use std::fs::FileType;
 use zstd::{
     Encoder,
     dict::{DecoderDictionary, EncoderDictionary},
@@ -24,7 +24,7 @@ use zstd::{
 
 use image::imageops::FilterType;
 use std::os::unix;
-use terminal_size::terminal_size;
+use terminal_size::{terminal_size, Height, Width};
 
 fn mkdir(dir_name: &str) {
     match fs::create_dir(dir_name) {
@@ -44,6 +44,53 @@ fn get_pixel(img: &ImageBuffer<Rgb<u8>, Vec<u8>>, x: &u32, y: &u32) -> u32 {
         0
     }
 }
+
+fn braille_buf(img: &Vec<Vec<bool>>, width: &u32, height: &u32) -> String {
+    //2*size.unwrap().0.0 as u32,4*(size.unwrap().1.0 -1) as u32
+    let positions = [
+        (0, 0, 0),
+        (0, 1, 1),
+        (0, 2, 2),
+        (1, 0, 3),
+        (1, 1, 4),
+        (1, 2, 5),
+        (0, 3, 6),
+        (1, 3, 7),
+    ];
+
+    let src_height = img.len() as u32;
+    let src_width = img[0].len() as u32;
+
+    let rows: Vec<u32> = (0..height / 4).collect();
+    let lines: Vec<String> = rows
+        .into_par_iter()
+        .map(|py| {
+            let mut codes = Vec::with_capacity((width / 2) as usize);
+            for px in (0..width / 2) {
+                let mut colors = 0u32;
+
+                for &(dx, dy, bit) in &positions {
+                    let x = px*2 + dx;
+                    let y = py*4 + dy;
+
+                    let src_x = x * src_width / width;
+                    let src_y = y * src_height /  height;
+
+                    if src_x < src_width && src_y < src_height {
+                        if img[src_y as usize][src_x as usize] {
+                            colors |= 1 << bit;
+                        }
+                    }
+                }
+
+                codes.push(0x2800 + colors);
+            }
+            unsafe { String::from_iter(codes.iter().map(|&c| char::from_u32_unchecked(c))) }
+        })
+        .collect();
+    lines.join("\n")
+}
+
 fn braille_iter<'a>(img: &'a Resized<'a>) -> String {
     //2*size.unwrap().0.0 as u32,4*(size.unwrap().1.0 -1) as u32
     let positions = [
@@ -64,13 +111,11 @@ fn braille_iter<'a>(img: &'a Resized<'a>) -> String {
             let mut codes = Vec::with_capacity((img.width / 2) as usize);
             for px in (0..img.width).step_by(2) {
                 let mut colors = 0u32;
-
                 for &(dx, dy, bit) in &positions {
                     let x = px + dx;
                     let y = py + dy;
                     if x < img.width && y < img.height {
-                        let color = img.get_rgb(x, y);
-                        if 128 < color {
+                        if img.read_rgb(x, y) {
                             colors |= 1 << bit;
                         }
                     }
@@ -142,32 +187,21 @@ impl<'a> FastImage<'a> {
 }
 
 impl<'a> Resized<'a> {
-    fn get_r(&self, x: u32, y: u32) -> u8 {
-        let cx = x.min(self.width.saturating_sub(1));
-        let cy = y.min(self.height.saturating_sub(1));
-
-        let src_x =
-            ((cx as f32 + 0.5) * (self.src.width as f32 / self.width as f32)).floor() as u32;
-        let src_y =
-            ((cy as f32 + 0.5) * (self.src.height as f32 / self.height as f32)).floor() as u32;
-
-        let idx = ((src_y * self.src.width + src_x) * 3) as usize;
-        self.src.buf[idx]
-    }
     #[inline(always)]
-    fn get_rgb(&self, x: u32, y: u32) -> u8 {
+    fn read_rgb(&self, x: u32, y: u32) -> bool {
         let src_x = x * self.src.width / self.width;
         let src_y = y * self.src.height / self.height;
 
         let idx = ((src_y * self.src.width + src_x) * 3) as usize;
         if idx < self.src.buf.len() {
             //self.src.buf[idx]
-            (0.299 * self.src.buf[idx] as f32
+            ((0.299 * self.src.buf[idx] as f32
                 + 0.587 * self.src.buf[idx + 1] as f32
                 + 0.114 * self.src.buf[idx + 2] as f32)
-                .round() as u8
+                .round() as u8)
+                > 128u8
         } else {
-            0
+            false
         }
     }
 }
@@ -186,25 +220,61 @@ fn compress(file_name: &str, max_frame: &u16) -> io::Result<()> {
     let now = time::Instant::now();
 
     let output = File::create(file_name)?;
-    let mut writer = BufWriter::new(output);
+    let writer = BufWriter::new(output);
 
     let dict_data = std::fs::read("dict.zstd")?;
 
     let mut encoder = Encoder::with_dictionary(writer, 19, &dict_data)?;
 
+    fn bool_to_u8(bits: &[bool]) -> Vec<u8> {
+        let mut vec = Vec::new();
+        let mut value = 0u8;
+
+        let mut loopcount = 0u8;
+        for &bit in bits {
+            if bit {
+                value += 1;
+            }
+            if 6 < loopcount {
+                vec.push(value);
+                value = 0;
+                loopcount = 0;
+            } else {
+                value <<= 1;
+                loopcount += 1;
+            }
+        }
+
+        vec
+    }
+
     for frame_count in 1..=(!max_frame as usize) {
         let frame: PathBuf = format!("output/frame/{frame_count}.png").into();
+        let frame_bin: PathBuf = format!("output/frame_bin/{frame_count}").into();
         println!("{:?}", frame);
 
         if frame.exists() {
-            let size = terminal_size().unwrap();
-            let image = open(&frame).unwrap().to_rgb8();
-            let fast_image = FastImage::from_image_buffer(&image);
+            let raw = open(&frame).unwrap();
+            let image = raw.as_rgb8().unwrap();
+
+            let mut vec = Vec::new();
+            for y in 0..image.height() {
+                for x in 0..image.width() {
+                    vec.push(image.get_pixel(x, y)[0] < 128);
+                }
+            }
+
+            let image_buffer = &bool_to_u8(&vec);
 
             if frame_count == 1 {
-                encoder.write_all(&(fast_image.buf.len() as u64).to_le_bytes())?;
+                encoder.write_all(&image.width().to_le_bytes())?;
+                encoder.write_all(&image.height().to_le_bytes())?;
+
+                encoder.write_all(&(image_buffer.len() as u32).to_le_bytes())?;
             }
-            encoder.write_all(&fast_image.buf)?;
+
+            encoder.write_all(image_buffer)?;
+            //File::create(frame_bin)?.write_all(image_buffer)?;
         } else {
             println!("Error file {:?} is not Exists.", frame);
         }
@@ -216,6 +286,32 @@ fn compress(file_name: &str, max_frame: &u16) -> io::Result<()> {
 }
 
 fn decode(file_name: &str) -> io::Result<()> {
+    fn resize_asp(width: u32, height: u32, target_width: u32, target_height: u32) -> (u32, u32) {
+        if width == target_width && height == target_height {
+            return (width, height);
+        }
+
+        let char_aspect = 4.0 / 2.0;
+        let target_px_w = target_width * 2;
+        let target_px_h = target_height * 4;
+
+        let aspect = width as f32 / height as f32;
+        let target_aspect = (target_px_w as f32 / target_px_h as f32) * char_aspect;
+
+        let (new_w, new_h ) = if aspect > target_aspect {
+            (
+                target_px_w,
+                ((target_px_w as f32 / aspect).ceil() as u32).min(target_px_h),
+            )
+        } else {
+            (
+                ((target_px_h as f32 * aspect).ceil() as u32).min(target_px_w),
+                target_px_h,
+            )
+        };
+        (new_w, new_h)
+    };
+
     let dict_data = std::fs::read("dict.zstd")?;
     let dict = DecoderDictionary::copy(&dict_data);
 
@@ -233,35 +329,75 @@ fn decode(file_name: &str) -> io::Result<()> {
         pulseaudio::play_audio();
     });
 
-    let mut len_buf = [0u8; 8];
+    let mut dimension_buf_len = [0u8; 4];
+    decoder.read_exact(&mut dimension_buf_len)?;
+    let width = u32::from_le_bytes(dimension_buf_len) as u32;
+
+    decoder.read_exact(&mut dimension_buf_len)?;
+    let height = u32::from_le_bytes(dimension_buf_len) as u32;
+
+    let mut len_buf = [0u8; 4];
 
     decoder.read_exact(&mut len_buf)?;
-    let frame_len = u64::from_le_bytes(len_buf) as usize;
-
+    let frame_len = u32::from_le_bytes(len_buf) as u32;
+    let mut frame = 0;
     loop {
-        let mut frame_buf = vec![0u8; frame_len];
+        frame += 1;
+        let mut frame_buf = vec![0u8; (frame_len) as usize];
         if decoder.read_exact(&mut frame_buf).is_err() {
+            println!("==== END ====");
             break;
         };
+        //let frame = u32::from_le_bytes(frame_buf) as u32;
 
         let now = time::Instant::now();
 
-        let size = terminal_size().unwrap();
-        let fast_image = FastImage::from_buffer(&frame_buf, 480, 360);
+        let (twidth, theight) = {
+            let term = terminal_size().unwrap();
+            (term.0.0 as u32, term.1.0 as u32)
+        };
+
+        //print!("\x1B[0;0H");
+        // ASCII is here!
+
+            let mut vec: Vec<Vec<bool>> = Vec::new();
+
+            let mut vec2 = Vec::new();
+            frame_buf.iter().enumerate().for_each(|(index, f)| {
+                if index as u32 % (width / 8) == 0 && index != 0{
+                    vec.push(vec2.clone());
+                    vec2 = Vec::new();
+                }
+
+                for i in 0..8 {
+                    vec2.push((f >> (7-i) & 1u8) == 0u8);
+                }
+            });
+
+
+
+        //let string: String = vec.iter().map(|x| {x.iter().map(|b| {if *b { '1' } else { '0' }}).collect::<String>()} + "\n").collect();
+        let (w, h) = {
+            let w = if twidth < width {twidth - 1} else {width};
+            let h = if theight < height {theight - 1} else {height};
+
+            resize_asp(width, height, w, h)
+        };
+
         print!("\x1B[0;0H");
-        let _ = to_ascii(&fast_image.resize_asp(size.0.0, size.1.0));
 
-        /*
-        match &open(&frame).unwrap().resize(2*size.unwrap().0.0 as u32,4*(size.unwrap().1.0 -1) as u32,FilterType::Nearest).as_rgb8() {
-            None => Ok(()),
-            Some(image) => to_ascii(&image),
-        };*/
+        println!("{}", braille_buf(&vec, &w, &h));
 
+        // 処理時間などの統計表示.
         played_frame += frame_delay;
         let duration = now.elapsed();
         print!("\x1B[0;0H");
-        print!("{:?}", duration);
-        stdout().flush().unwrap();
+        print!(
+            "{:>7}frame | dul: {:?}",
+            frame,
+            duration,
+        );
+        stdout().flush()?;
         total_process_duration += now.elapsed();
         thread::sleep(time::Duration::from_nanos(
             frame_delay.saturating_sub(
@@ -313,12 +449,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fast_image = FastImage::from_image_buffer(&image);
             print!("\x1B[0;0H");
             let _ = to_ascii(&fast_image.resize_asp(size.0.0, size.1.0));
-
-            /*
-            match &open(&frame).unwrap().resize(2*size.unwrap().0.0 as u32,4*(size.unwrap().1.0 -1) as u32,FilterType::Nearest).as_rgb8() {
-                None => Ok(()),
-                Some(image) => to_ascii(&image),
-            };*/
 
             played_frame += frame_delay;
             let duration = now.elapsed();
