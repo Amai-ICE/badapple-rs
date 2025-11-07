@@ -20,14 +20,15 @@ use zstd::{
 
 fn braille_buf(img: &Vec<Vec<bool>>, width: &u32, height: &u32) -> String {
     let positions = [
-        (0, 0),
-        (0, 1),
-        (0, 2),
-        (1, 0),
-        (1, 1),
-        (1, 2),
-        (0, 3),
-        (1, 3),
+        // this pos are means braille ascii dot positions.
+        (0, 0), //  ⠁
+        (0, 1), //  ⠂
+        (0, 2), //  ⠄
+        (1, 0), //  ⠈
+        (1, 1), //  ⠐
+        (1, 2), //  ⠠
+        (0, 3), //  ⡀
+        (1, 3), //  ⢀
     ];
 
     let src_height = img.len() as u32;
